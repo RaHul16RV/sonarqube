@@ -1,0 +1,665 @@
+pipeline {
+    agent any
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '15'))
+        timestamps()
+        disableConcurrentBuilds()
+        ansiColor('xterm')
+    }
+
+    parameters {
+        choice(
+            name: 'BRANCH',
+            choices: [
+                'dockerize/admin3.0',
+                'sc-admin-3.0',
+                'sc-admin/staging',
+                'develop',
+                'main'
+            ],
+            description: 'Git branch to build and push. No client env here.'
+        )
+
+        string(
+            name: 'REPORT_BRANCH',
+            defaultValue: 'main',
+            description: 'GitLab branch where SonarQube reports will be committed'
+        )
+    }
+
+    environment {
+        APP_REPOSITORY = 'https://gitlab.stackwarriors.in/root/sc-admin-3.0-frontend'
+        GIT_CREDENTIALS_ID = 'gittoken'
+        REGISTRY_HOST = 'gitlab.stackwarriors.in:5050'
+        REGISTRY_CREDENTIALS_ID = 'gittoken'
+        IMAGE = "${REGISTRY_HOST}/root/sc-admin-3.0-frontend"
+        APP_VERSION = "1.0.${BUILD_NUMBER}"
+        NEXT_TELEMETRY_DISABLED = '1'
+
+        PATH = "/opt/sonar-scanner/bin:${env.PATH}"
+
+        SONAR_PROJECT_KEY = 'SC-ADMIN-FRONTEND'
+        SONAR_PROJECT_NAME = 'SC-ADMIN-FRONTEND'
+        SONAR_URL = 'http://77.37.47.61:9000'
+
+        REPORT_REPOSITORY = 'https://gitlab.stackwarriors.in/CMP/dockerize-admin-3.0.git'
+        REPORT_BASE_PATH = 'admin-frontend/sonar-report'
+        TRIVY_REPORT_BASE_PATH = 'admin-frontend/trivy-report'
+        REPORT_BRANCH = "${params.REPORT_BRANCH ?: 'main'}"
+    }
+
+    stages {
+        stage('Checkout Application') {
+            steps {
+                echo '=============================================='
+                echo 'CHECKOUT APPLICATION'
+                echo '=============================================='
+
+                deleteDir()
+
+                git(
+                    branch: "${params.BRANCH}",
+                    credentialsId: "${env.GIT_CREDENTIALS_ID}",
+                    url: "${env.APP_REPOSITORY}"
+                )
+
+                echo "Repository   : ${env.APP_REPOSITORY}"
+                echo "Branch       : ${params.BRANCH}"
+                echo "Build Number : ${env.BUILD_NUMBER}"
+                echo "App Version  : ${env.APP_VERSION}"
+
+                sh '''
+                    set -e
+
+                    if [ ! -f Dockerfile ]; then
+                        echo "ERROR: Dockerfile not found."
+                        exit 1
+                    fi
+
+                    if [ ! -f package-lock.json ]; then
+                        echo "ERROR: package-lock.json not found. Docker uses npm ci."
+                        exit 1
+                    fi
+                '''
+            }
+        }
+
+        stage('Check Sonar Scanner') {
+            steps {
+                echo '=============================================='
+                echo 'CHECKING SONAR SCANNER'
+                echo '=============================================='
+
+                sh '''
+                    set -eu
+                    command -v sonar-scanner
+                    sonar-scanner --version
+                    echo "Sonar Scanner is available."
+                '''
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                echo '=============================================='
+                echo 'RUNNING SONARQUBE ANALYSIS'
+                echo '=============================================='
+
+                echo "SonarQube URL    : ${env.SONAR_URL}"
+                echo "Project Key      : ${env.SONAR_PROJECT_KEY}"
+                echo "Project Name     : ${env.SONAR_PROJECT_NAME}"
+                echo "Application      : ${env.APP_REPOSITORY}"
+                echo "Branch           : ${params.BRANCH}"
+                echo "Build            : ${env.BUILD_NUMBER}"
+                echo "Application Ver. : ${env.APP_VERSION}"
+
+                withSonarQubeEnv('sonarqube') {
+                    withCredentials([
+                        string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')
+                    ]) {
+                        sh '''
+                            set -eu
+
+                            sonar-scanner \
+                                -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
+                                -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
+                                -Dsonar.sources=. \
+                                -Dsonar.exclusions="node_modules/**,.next/**,coverage/**,dist/**,build/**,public/**" \
+                                -Dsonar.token="$SONAR_TOKEN"
+
+                            echo "SONARQUBE ANALYSIS COMPLETED"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                echo '=============================================='
+                echo 'WAITING FOR SONARQUBE QUALITY GATE'
+                echo '=============================================='
+
+                script {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        def qg = waitForQualityGate(abortPipeline: false)
+                        env.SONAR_QG_STATUS = qg.status
+                    }
+                    echo "Quality gate status: ${env.SONAR_QG_STATUS}"
+                    if (env.SONAR_QG_STATUS != 'OK') {
+                        echo 'Quality gate failed. Reports will still be generated and Docker build will still run. Build will be UNSTABLE.'
+                    }
+                }
+            }
+        }
+
+        stage('Generate SonarQube Report') {
+            steps {
+                echo '=============================================='
+                echo 'GENERATING SONARQUBE REPORT'
+                echo '=============================================='
+
+                withCredentials([
+                    string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')
+                ]) {
+                    sh '''
+                        set -eu
+
+                        rm -rf sonarqube-report
+                        mkdir -p sonarqube-report
+
+                        command -v curl
+                        command -v python3
+
+                        curl -fsS \
+                            -u "$SONAR_TOKEN:" \
+                            "$SONAR_URL/api/measures/component?component=${SONAR_PROJECT_KEY}&metricKeys=bugs,vulnerabilities,security_hotspots,code_smells,coverage,duplicated_lines_density,ncloc,reliability_rating,security_rating,sqale_rating" \
+                            > sonarqube-report/measures.json
+
+                        curl -fsS \
+                            -u "$SONAR_TOKEN:" \
+                            "$SONAR_URL/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}" \
+                            > sonarqube-report/quality-gate.json
+
+                        python3 <<'PYTHON'
+import json
+import os
+from datetime import datetime
+
+MEASURES_FILE = "sonarqube-report/measures.json"
+QUALITY_GATE_FILE = "sonarqube-report/quality-gate.json"
+REPORT_FILE = "sonarqube-report/SC-ADMIN-FRONTEND-sonarqube-report.txt"
+
+with open(MEASURES_FILE) as f:
+    data = json.load(f)
+
+measures = {
+    item["metric"]: item["value"]
+    for item in data.get("component", {}).get("measures", [])
+}
+
+def get(metric, default="0"):
+    return measures.get(metric, default)
+
+def rating(value):
+    ratings = {"1": "A", "2": "B", "3": "C", "4": "D", "5": "E"}
+    return ratings.get(str(value), str(value))
+
+with open(QUALITY_GATE_FILE) as f:
+    quality_data = json.load(f)
+
+quality_gate = quality_data.get("projectStatus", {}).get("status", "UNKNOWN")
+
+build_number = os.environ.get("BUILD_NUMBER", "UNKNOWN")
+branch = os.environ.get("BRANCH", os.environ.get("GIT_BRANCH", "UNKNOWN"))
+project = os.environ.get("SONAR_PROJECT_KEY", "SC-ADMIN-FRONTEND")
+project_name = os.environ.get("SONAR_PROJECT_NAME", "SC-ADMIN-FRONTEND")
+app_version = os.environ.get("APP_VERSION", "UNKNOWN")
+generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+bugs = get("bugs")
+vulnerabilities = get("vulnerabilities")
+security_hotspots = get("security_hotspots")
+code_smells = get("code_smells")
+coverage = get("coverage")
+duplicated_lines = get("duplicated_lines_density")
+ncloc = get("ncloc")
+reliability_rating = rating(get("reliability_rating", "N/A"))
+security_rating = rating(get("security_rating", "N/A"))
+maintainability_rating = rating(get("sqale_rating", "N/A"))
+
+report = f"""
+{project_name}
+SonarQube Code Quality Report
+==============================================
+
+Jenkins Build     : #{build_number}
+
+Application Ver.  : {app_version}
+
+Git Branch        : {branch}
+
+Project Key       : {project}
+
+Generated         : {generated}
+
+Quality Gate      : {quality_gate}
+
+
+==============================================
+1. EXECUTIVE SUMMARY
+==============================================
+
+Bugs                  : {bugs}
+
+Vulnerabilities       : {vulnerabilities}
+
+Security Hotspots     : {security_hotspots}
+
+Code Smells           : {code_smells}
+
+Coverage              : {coverage}%
+
+Duplicated Lines      : {duplicated_lines}%
+
+Lines of Code         : {ncloc}
+
+
+==============================================
+2. QUALITY RATINGS
+==============================================
+
+Reliability           : {reliability_rating}
+
+Security              : {security_rating}
+
+Maintainability       : {maintainability_rating}
+
+
+==============================================
+3. PROJECT STATISTICS
+==============================================
+
+Lines of Code         : {ncloc}
+
+Bugs                  : {bugs}
+
+Vulnerabilities       : {vulnerabilities}
+
+Security Hotspots     : {security_hotspots}
+
+Code Smells           : {code_smells}
+
+Code Coverage         : {coverage}%
+
+Duplicated Lines      : {duplicated_lines}%
+
+
+==============================================
+4. SECURITY SUMMARY
+==============================================
+
+Vulnerabilities       : {vulnerabilities}
+
+Security Rating       : {security_rating}
+
+Security Hotspots     : {security_hotspots}
+
+
+==============================================
+5. RECOMMENDATIONS
+==============================================
+
+Review and resolve outstanding bugs.
+
+Review unresolved security hotspots.
+
+Increase automated test coverage.
+
+Monitor and reduce duplicated code.
+
+Review code smells based on severity.
+
+Maintain the current Quality Gate status.
+
+
+==============================================
+
+Generated automatically by Jenkins + SonarQube.
+
+Project        : {project}
+
+Project Name   : {project_name}
+
+Jenkins Build  : #{build_number}
+
+Application Ver.: {app_version}
+
+Git Branch     : {branch}
+
+Quality Gate   : {quality_gate}
+
+"""
+
+with open(REPORT_FILE, "w") as f:
+    f.write(report)
+
+print("SONARQUBE REPORT GENERATED")
+print(REPORT_FILE)
+print(report)
+PYTHON
+
+                        echo "REPORT GENERATED SUCCESSFULLY"
+                        ls -lh sonarqube-report/
+                        cat sonarqube-report/SC-ADMIN-FRONTEND-sonarqube-report.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Archive SonarQube Report') {
+            steps {
+                echo '=============================================='
+                echo 'ARCHIVING SONARQUBE REPORT'
+                echo '=============================================='
+
+                archiveArtifacts(
+                    artifacts: 'sonarqube-report/SC-ADMIN-FRONTEND-sonarqube-report.txt',
+                    fingerprint: true
+                )
+            }
+        }
+
+        stage('Push SonarQube Report to GitLab') {
+            steps {
+                echo '=============================================='
+                echo 'PUSHING SONARQUBE REPORT TO GITLAB'
+                echo '=============================================='
+
+                echo "Report Repository : ${env.REPORT_REPOSITORY}"
+                echo "Report Branch     : ${params.REPORT_BRANCH}"
+                echo "Application Ver.  : ${env.APP_VERSION}"
+
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: "${env.GIT_CREDENTIALS_ID}",
+                        usernameVariable: 'GITLAB_USER',
+                        passwordVariable: 'GITLAB_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        REPORT_BRANCH="${REPORT_BRANCH:-main}"
+
+                        if [ -z "${GITLAB_USER}" ] || [ -z "${GITLAB_TOKEN}" ]; then
+                            echo "ERROR: GitLab report credentials are empty."
+                            exit 1
+                        fi
+
+                        if [ ! -f "sonarqube-report/SC-ADMIN-FRONTEND-sonarqube-report.txt" ]; then
+                            echo "ERROR: SonarQube report not found."
+                            exit 1
+                        fi
+
+                        rm -rf report-repository
+
+                        REPO_URL="${REPORT_REPOSITORY#https://}"
+                        git clone \
+                            "https://${GITLAB_USER}:${GITLAB_TOKEN}@${REPO_URL}" \
+                            report-repository
+
+                        cd report-repository
+                        git fetch origin
+
+                        if git show-ref --verify --quiet "refs/remotes/origin/${REPORT_BRANCH}"; then
+                            git checkout -B "${REPORT_BRANCH}" "origin/${REPORT_BRANCH}"
+                        else
+                            git checkout -b "${REPORT_BRANCH}"
+                        fi
+
+                        VERSION_REPORT_PATH="${REPORT_BASE_PATH}/${APP_VERSION}"
+                        mkdir -p "${VERSION_REPORT_PATH}"
+
+                        cp \
+                            "../sonarqube-report/SC-ADMIN-FRONTEND-sonarqube-report.txt" \
+                            "${VERSION_REPORT_PATH}/SC-ADMIN-FRONTEND-sonarqube-report.txt"
+
+                        git config user.name "Jenkins"
+                        git config user.email "jenkins@gitlab.stackwarriors.in"
+
+                        git add "${VERSION_REPORT_PATH}/SC-ADMIN-FRONTEND-sonarqube-report.txt"
+
+                        if git diff --cached --quiet; then
+                            echo "No report changes detected."
+                        else
+                            git commit -m "Add SonarQube report - ${APP_VERSION} - Build ${BUILD_NUMBER}"
+                            git push origin "HEAD:${REPORT_BRANCH}"
+                        fi
+
+                        echo "Report: ${VERSION_REPORT_PATH}/SC-ADMIN-FRONTEND-sonarqube-report.txt"
+                    '''
+                }
+            }
+        }
+
+        stage('Enforce Quality Gate') {
+            steps {
+                echo "SonarQube Quality Gate: ${env.SONAR_QG_STATUS}"
+                echo "Dashboard: ${env.SONAR_URL}/dashboard?id=${env.SONAR_PROJECT_KEY}"
+                echo 'Jenkins does not fail the build on this status. Fix the gate in SonarQube to see OK.'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                echo '=============================================='
+                echo 'BUILDING DOCKER IMAGE'
+                echo '=============================================='
+
+                echo "Image      : ${env.IMAGE}:${env.APP_VERSION}"
+                echo "Latest Tag : ${env.IMAGE}:latest"
+
+                sh '''
+                    set -e
+                    DOCKER_BUILDKIT=1 docker build \
+                        --pull \
+                        --progress=plain \
+                        -t "${IMAGE}:${APP_VERSION}" \
+                        -t "${IMAGE}:latest" \
+                        -f Dockerfile \
+                        .
+                '''
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                echo '=============================================='
+                echo 'TRIVY DOCKER IMAGE SCAN'
+                echo '=============================================='
+
+                echo "Image: ${env.IMAGE}:${env.APP_VERSION}"
+
+                sh '''
+                    set -eu
+
+                    command -v trivy
+                    trivy --version
+
+                    rm -rf trivy-report
+                    mkdir -p trivy-report
+
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --format table \
+                        --output "trivy-report/SC-ADMIN-FRONTEND-trivy-report.txt" \
+                        "${IMAGE}:${APP_VERSION}"
+
+                    echo "=============================================="
+                    echo "TRIVY REPORT"
+                    echo "=============================================="
+                    cat "trivy-report/SC-ADMIN-FRONTEND-trivy-report.txt"
+                '''
+            }
+        }
+
+        stage('Archive Trivy Report') {
+            steps {
+                echo '=============================================='
+                echo 'ARCHIVING TRIVY REPORT'
+                echo '=============================================='
+
+                archiveArtifacts(
+                    artifacts: 'trivy-report/SC-ADMIN-FRONTEND-trivy-report.txt',
+                    fingerprint: true
+                )
+            }
+        }
+
+        stage('Push Trivy Report to GitLab') {
+            steps {
+                echo '=============================================='
+                echo 'PUSHING TRIVY REPORT TO GITLAB'
+                echo '=============================================='
+
+                echo "Report Repository : ${env.REPORT_REPOSITORY}"
+                echo "Report Branch     : ${params.REPORT_BRANCH}"
+                echo "Application Ver.  : ${env.APP_VERSION}"
+
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: "${env.GIT_CREDENTIALS_ID}",
+                        usernameVariable: 'GITLAB_USER',
+                        passwordVariable: 'GITLAB_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        REPORT_BRANCH="${REPORT_BRANCH:-main}"
+
+                        if [ -z "${GITLAB_USER}" ] || [ -z "${GITLAB_TOKEN}" ]; then
+                            echo "ERROR: GitLab report credentials are empty."
+                            exit 1
+                        fi
+
+                        if [ ! -f "trivy-report/SC-ADMIN-FRONTEND-trivy-report.txt" ]; then
+                            echo "ERROR: Trivy report not found."
+                            exit 1
+                        fi
+
+                        rm -rf report-repository
+
+                        REPO_URL="${REPORT_REPOSITORY#https://}"
+                        git clone \
+                            "https://${GITLAB_USER}:${GITLAB_TOKEN}@${REPO_URL}" \
+                            report-repository
+
+                        cd report-repository
+                        git fetch origin
+
+                        if git show-ref --verify --quiet "refs/remotes/origin/${REPORT_BRANCH}"; then
+                            git checkout -B "${REPORT_BRANCH}" "origin/${REPORT_BRANCH}"
+                        else
+                            git checkout -b "${REPORT_BRANCH}"
+                        fi
+
+                        VERSION_REPORT_PATH="${TRIVY_REPORT_BASE_PATH}/${APP_VERSION}"
+                        mkdir -p "${VERSION_REPORT_PATH}"
+
+                        cp \
+                            "../trivy-report/SC-ADMIN-FRONTEND-trivy-report.txt" \
+                            "${VERSION_REPORT_PATH}/SC-ADMIN-FRONTEND-trivy-report.txt"
+
+                        git config user.name "Jenkins"
+                        git config user.email "jenkins@gitlab.stackwarriors.in"
+
+                        git add "${VERSION_REPORT_PATH}/SC-ADMIN-FRONTEND-trivy-report.txt"
+
+                        if git diff --cached --quiet; then
+                            echo "No Trivy report changes detected."
+                        else
+                            git commit -m "Add Trivy image report - ${APP_VERSION} - Build ${BUILD_NUMBER}"
+                            git push origin "HEAD:${REPORT_BRANCH}"
+                        fi
+
+                        echo "Report: ${VERSION_REPORT_PATH}/SC-ADMIN-FRONTEND-trivy-report.txt"
+                    '''
+                }
+            }
+        }
+
+        stage('Push Docker Image') {
+            steps {
+                echo '=============================================='
+                echo 'PUSHING DOCKER IMAGES'
+                echo '=============================================='
+
+                withCredentials([usernamePassword(
+                    credentialsId: "${env.REGISTRY_CREDENTIALS_ID}",
+                    usernameVariable: 'REGISTRY_USER',
+                    passwordVariable: 'REGISTRY_PASSWORD'
+                )]) {
+                    sh '''
+                        set -e
+                        echo "$REGISTRY_PASSWORD" | docker login "${REGISTRY_HOST}" -u "$REGISTRY_USER" --password-stdin
+                        docker push "${IMAGE}:${APP_VERSION}"
+                        docker push "${IMAGE}:latest"
+                        docker logout "${REGISTRY_HOST}" || true
+                    '''
+                }
+            }
+        }
+
+        stage('Image Summary') {
+            steps {
+                echo '=============================================='
+                echo 'DOCKER IMAGE SUMMARY'
+                echo '=============================================='
+                echo "${env.IMAGE}:${env.APP_VERSION}"
+                echo "${env.IMAGE}:latest"
+                echo 'SonarQube Report:'
+                echo "${env.REPORT_BASE_PATH}/${env.APP_VERSION}/SC-ADMIN-FRONTEND-sonarqube-report.txt"
+                echo 'Trivy Report:'
+                echo "${env.TRIVY_REPORT_BASE_PATH}/${env.APP_VERSION}/SC-ADMIN-FRONTEND-trivy-report.txt"
+                echo 'Deploy on each client host with docker compose and that client .env'
+                echo '=============================================='
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "=============================================="
+            echo "CI PIPELINE COMPLETED SUCCESSFULLY"
+            echo "=============================================="
+            echo "Application Branch : ${params.BRANCH}"
+            echo "Build Number       : #${env.BUILD_NUMBER}"
+            echo "Application Version: ${env.APP_VERSION}"
+            echo "Docker Image       : ${env.IMAGE}:${env.APP_VERSION}"
+            echo "Docker Latest      : ${env.IMAGE}:latest"
+            echo "SonarQube Project  : ${env.SONAR_PROJECT_KEY}"
+            echo "SonarQube Report   : ${env.REPORT_BASE_PATH}/${env.APP_VERSION}/SC-ADMIN-FRONTEND-sonarqube-report.txt"
+            echo "Trivy Report       : ${env.TRIVY_REPORT_BASE_PATH}/${env.APP_VERSION}/SC-ADMIN-FRONTEND-trivy-report.txt"
+            echo "=============================================="
+        }
+        failure {
+            echo "=============================================="
+            echo "CI PIPELINE FAILED"
+            echo "=============================================="
+            echo "Build Number       : #${env.BUILD_NUMBER}"
+            echo "Application Branch : ${params.BRANCH}"
+            echo "Application Version: ${env.APP_VERSION}"
+            echo "Please check the Jenkins console output."
+            echo "=============================================="
+        }
+        always {
+            sh '''
+                docker logout "${REGISTRY_HOST}" || true
+                docker image prune -f || true
+            '''
+            cleanWs()
+        }
+    }
+}
